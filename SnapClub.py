@@ -15,7 +15,7 @@ from r2_uploader import upload_file_to_r2
 # CONFIGURATION
 # ===================================================================
 BATCH_SIZE = 1000
-MAX_WORKERS = 10
+MAX_WORKERS = 5
 PAUSE_BETWEEN_BATCHES_SECONDS = 310
 ERROR_PAUSE_SECONDS = 300
 
