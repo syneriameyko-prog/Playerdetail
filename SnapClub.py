@@ -12,7 +12,7 @@ from r2_uploader import upload_file_to_r2
 # CONFIGURATION OPTIMISÉE (FLUX CONTINU)
 # ===================================================================
 BATCH_SIZE = 30000              # On traite tout en un seul bloc
-MAX_WORKERS = 3                 # On limite à 3 requêtes simultanées (conseil Discord)
+MAX_WORKERS = 2                 # On limite à 3 requêtes simultanées (conseil Discord)
 PAUSE_BETWEEN_BATCHES_SECONDS = 0 # Plus de pause entre les lots
 ERROR_PAUSE_SECONDS = 20        # Si 403, on attend 20s au lieu de 5 min
 
