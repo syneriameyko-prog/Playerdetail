@@ -1,0 +1,14 @@
+# Pour les requêtes web
+requests
+
+# Pour les barres de progression
+tqdm
+
+# Pour la connexion à la base de données PostgreSQL (Supabase)
+psycopg2-binary
+
+# Pour le traitement des données de matchs (très important)
+pandas
+
+boto3
+python-dotenv
