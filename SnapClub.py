@@ -14,10 +14,10 @@ from r2_uploader import upload_file_to_r2
 # ===================================================================
 # CONFIGURATION
 # ===================================================================
-BATCH_SIZE = 1000
-MAX_WORKERS = 5
+BATCH_SIZE = 8000
+MAX_WORKERS = 3
 PAUSE_BETWEEN_BATCHES_SECONDS = 310
-ERROR_PAUSE_SECONDS = 300
+ERROR_PAUSE_SECONDS = 10
 
 # Noms des fichiers de sortie
 PLAYERS_DB_PATH = "player_details.sqlite"
