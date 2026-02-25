@@ -12,7 +12,7 @@ from r2_uploader import upload_file_to_r2
 # CONFIGURATION OPTIMISÉE (FLUX CONTINU)
 # ===================================================================
 BATCH_SIZE = 30000              # On traite tout en un seul bloc
-MAX_WORKERS = 2                 # On limite à 3 requêtes simultanées (conseil Discord)
+MAX_WORKERS = 1                 # On limite à 3 requêtes simultanées (conseil Discord)
 PAUSE_BETWEEN_BATCHES_SECONDS = 0 # Plus de pause entre les lots
 ERROR_PAUSE_SECONDS = 20        # Si 403, on attend 20s au lieu de 5 min
 
@@ -98,7 +98,7 @@ def get_agent_snapshot(args):
     
     # Micro-délai pour maintenir un débit constant et ne pas saturer l'API
     # 3 workers avec 0.7s de pause = environ 4.2 requêtes/seconde. (C'est la vitesse idéale)
-    time.sleep(0.6)
+    time.sleep(0.4)
     
     logging.info(f"  → [SNAP] Agent {agent_wallet_address} ({index}/{total_in_batch})")
     try:
