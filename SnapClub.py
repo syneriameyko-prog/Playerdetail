@@ -1,5 +1,6 @@
-# SnapClub.py (Version 3.0 - Mode Vrac par Pagination)
+# SnapClub.py (Version 4.0 - Hybrid MariaDB + SQLite)
 import os, json, time, logging, sys, sqlite3, requests
+import mysql.connector
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from datetime import datetime
@@ -9,14 +10,20 @@ from r2_uploader import upload_file_to_r2
 # ===================================================================
 # CONFIGURATION
 # ===================================================================
-# Noms des fichiers de sortie
 PLAYERS_DB_PATH = "player_details.sqlite"
 CONTRACTS_DB_PATH = "Contrats.sqlite"
 AGENTS_DB_PATH = "Agents.sqlite"
 
-# Paramètres de l'API
 LIMIT_PER_PAGE = 1500
-SAFE_SLEEP = 0  # Petite pause entre chaque page de 1500 joueurs
+SAFE_SLEEP = 0 
+
+# CONFIGURATION MARIADB (Utilise les Secrets GitHub)
+DB_CONFIG = {
+    'host': os.getenv("DB_HOST"),      # Mets l'IP publique de ta VM Oracle dans les secrets GitHub
+    'user': os.getenv("DB_USER", "ubuntu"),
+    'password': os.getenv("DB_PASSWORD"), # Ton mot de passe 'ton_pass' dans les secrets
+    'database': os.getenv("DB_NAME", "mfl_stats")
+}
 
 # Configuration des poids pour le Real OVR
 STATS_ORDER = ['passing', 'shooting', 'defense', 'dribbling', 'pace', 'physical']
@@ -43,14 +50,14 @@ def setup_logging():
 
 def create_requests_session():
     session = requests.Session()
-    session.headers.update({'User-Agent': 'SnapClub-Bulk-v3.0', 'Accept': 'application/json'})
+    session.headers.update({'User-Agent': 'SnapClub-Bulk-v4.0', 'Accept': 'application/json'})
     retries = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
     return session
 
 def safe_request(url, session):
     try:
-        response = session.get(url, timeout=60) # 60s car les pages de 1500 sont lourdes
+        response = session.get(url, timeout=60)
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -63,48 +70,106 @@ def calculate_real_note(stats, position):
     return int(round(note))
 
 # ===================================================================
-# COLLECTE DES DONNÉES
+# NOUVELLE LOGIQUE MARIADB (HISTORIQUE)
+# ===================================================================
+
+def sync_to_mariadb_history(players_list):
+    """Compare les stats et crée l'historique dans MariaDB (VM Oracle)."""
+    if not DB_CONFIG['host'] or not DB_CONFIG['password']:
+        logging.warning("⚠️ Config MariaDB absente (Secrets GitHub non configurés). Skip sync.")
+        return
+
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor(dictionary=True)
+        now_ts = int(time.time() * 1000)
+
+        logging.info(f"Synchronisation MariaDB pour {len(players_list)} joueurs...")
+
+        for p in players_list:
+            p_id = int(p['id'])
+            meta = p.get('metadata', {})
+            
+            new_stats = {
+                'overall': meta.get('overall', 0),
+                'age': meta.get('age', 0),
+                'pace': meta.get('pace', 0),
+                'shooting': meta.get('shooting', 0),
+                'passing': meta.get('passing', 0),
+                'dribbling': meta.get('dribbling', 0),
+                'defense': meta.get('defense', 0),
+                'physical': meta.get('physical', 0)
+            }
+
+            # 1. On récupère l'ancienne photo du joueur
+            cursor.execute("SELECT * FROM players_snapshot WHERE id = %s", (p_id,))
+            old_data = cursor.fetchone()
+
+            if old_data:
+                # 2. On cherche les changements
+                diff = {}
+                for stat, val in new_stats.items():
+                    if val != old_data.get(stat):
+                        diff[stat] = val
+                
+                # 3. Si changement -> Inscription dans l'histoire
+                if diff:
+                    reason = "TRAINING"
+                    if 'age' in diff: reason = "NEW_AGE"
+                    
+                    cursor.execute(
+                        "INSERT INTO players_history (player_id, date, reasonType, values_changed) VALUES (%s, %s, %s, %s)",
+                        (p_id, now_ts, reason, json.dumps(diff))
+                    )
+
+            # 4. Mise à jour du Snapshot
+            sql_snap = """
+                INSERT INTO players_snapshot 
+                (id, first_name, last_name, age, overall, pace, shooting, passing, dribbling, defense, physical, last_updated)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE 
+                overall=VALUES(overall), age=VALUES(age), last_updated=VALUES(last_updated),
+                pace=VALUES(pace), shooting=VALUES(shooting), passing=VALUES(passing),
+                dribbling=VALUES(dribbling), defense=VALUES(defense), physical=VALUES(physical)
+            """
+            cursor.execute(sql_snap, (
+                p_id, meta.get('firstName'), meta.get('lastName'), new_stats['age'],
+                new_stats['overall'], new_stats['pace'], new_stats['shooting'],
+                new_stats['passing'], new_stats['dribbling'], new_stats['defense'],
+                new_stats['physical'], now_ts
+            ))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        logging.info("✅ MariaDB synchronisée.")
+    except Exception as e:
+        logging.error(f"❌ Erreur MariaDB : {e}")
+
+# ===================================================================
+# COLLECTE & SQLITE (TON CODE D'ORIGINE)
 # ===================================================================
 
 def get_agents_leaderboard(session):
-    """Récupère le leaderboard des agents (nécessaire pour Agents.sqlite)."""
-    logging.info("Récupération du leaderboard des agents...")
     url = "https://z519wdyajg.execute-api.us-east-1.amazonaws.com/prod/leaderboards/users/global?limit=20000&sort=nbPlayers&sortOrder=DESC"
     data = safe_request(url, session)
-    if data:
-        return [a for a in data.get('users', []) if a.get('nbPlayers', 0) > 0]
-    return []
+    return [a for a in data.get('users', []) if a.get('nbPlayers', 0) > 0] if data else []
 
 def get_all_players_bulk(session):
-    """Récupère TOUS les joueurs de l'API par pages de 1500 (méthode Vrac)."""
     all_players = []
     last_id = None
-    
-    # On affiche une barre de progression (estimation ~250 pages pour 370k joueurs)
-    pbar = tqdm(desc="[Collecte] Pages de joueurs", unit=" page")
-    
+    pbar = tqdm(desc="[Collecte] Pages", unit=" page")
     while True:
         url = f"https://z519wdyajg.execute-api.us-east-1.amazonaws.com/prod/players?limit={LIMIT_PER_PAGE}"
-        if last_id:
-            url += f"&beforePlayerId={last_id}"
-        
+        if last_id: url += f"&beforePlayerId={last_id}"
         data = safe_request(url, session)
-        if not data or len(data) == 0:
-            break # Plus de joueurs à récupérer
-            
+        if not data: break
         all_players.extend(data)
-        last_id = data[-1]['id'] # On prend l'ID du dernier joueur pour la page suivante
-        
+        last_id = data[-1]['id']
         pbar.update(1)
-        time.sleep(SAFE_SLEEP) # Respect de l'API
-        
+        time.sleep(SAFE_SLEEP)
     pbar.close()
-    logging.info(f"Total collecté : {len(all_players)} joueurs.")
     return all_players
-
-# ===================================================================
-# MISE À JOUR BASES DE DONNÉES
-# ===================================================================
 
 def setup_databases():
     with sqlite3.connect(PLAYERS_DB_PATH) as conn:
@@ -116,38 +181,26 @@ def setup_databases():
 
 def update_all_databases(players_list, agents_list):
     now = datetime.utcnow().isoformat()
-    
-    # 1. Mise à jour Agents
+    # 1. Agents
     agents_data = [(a.get('walletAddress'), a.get('name'), a.get('nbPlayers', 0), a.get('nbClubs', 0), a.get('nbTrophies', 0), a.get('nbMflPoints', 0), a.get('nbMflPointsLastSeason', 0), a.get('country'), a.get('city'), a.get('twitter'), now) for a in agents_list]
     with sqlite3.connect(AGENTS_DB_PATH) as conn:
         conn.cursor().executemany("INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(wallet_address) DO UPDATE SET name=excluded.name, nb_players=excluded.nb_players, last_updated_at=excluded.last_updated_at", agents_data)
-
-    # 2. Préparation Players et Contracts
+    # 2. Players & Contracts
     players_data = []
     contracts_data = []
-    
-    logging.info("Traitement des données et calcul des Real OVR...")
-    for p in tqdm(players_list, desc="[Traitement] Joueurs"):
-        meta = p.get('metadata', {})
-        owned = p.get('ownedBy', {})
+    for p in players_list:
+        meta = p.get('metadata', {}); owned = p.get('ownedBy', {})
         stats = {s: meta.get(s, 0) for s in STATS_ORDER + ['overall', 'goalkeeping']}
-        pos_list = meta.get('positions', [])
-        
-        # Calcul Real Notes avec malus de -1 pour postes secondaires
-        real_notes = {pos: (calculate_real_note(stats, pos) - (1 if i > 0 else 0)) for i, pos in enumerate(pos_list)}
-        
+        real_notes = {pos: (calculate_real_note(stats, pos) - (1 if i > 0 else 0)) for i, pos in enumerate(meta.get('positions', []))}
         players_data.append((int(p['id']), meta.get('firstName'), meta.get('lastName'), meta.get('age'), json.dumps(meta.get('nationalities', [])), meta.get('preferredFoot'), stats['overall'], stats['defense'], stats['shooting'], stats['passing'], stats['dribbling'], stats['pace'], stats['physical'], stats['goalkeeping'], json.dumps(real_notes), meta.get('retirementYears'), owned.get('name'), now))
-        
         if p.get('activeContract'):
             cont = p['activeContract']; club = cont.get('club', {})
             contracts_data.append((int(p['id']), meta.get('firstName'), meta.get('lastName'), meta.get('age'), meta.get('overall'), owned.get('walletAddress'), owned.get('name'), owned.get('twitter'), cont.get('status'), cont.get('kind'), cont.get('revenueShare'), cont.get('totalRevenueShareLocked'), club.get('id'), club.get('name'), club.get('division'), cont.get('nbSeasons'), cont.get('createdDateTime'), json.dumps(cont.get('clauses', [])), now))
-
-    # Injection massive en BDD
-    with sqlite3.connect(PLAYERS_DB_PATH) as conn:
-        conn.cursor().executemany("INSERT INTO players VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET overall=excluded.overall, manager=excluded.manager, last_updated_at=excluded.last_updated_at", players_data)
     
+    with sqlite3.connect(PLAYERS_DB_PATH) as conn:
+        conn.cursor().executemany("INSERT INTO players VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET overall=excluded.overall, last_updated_at=excluded.last_updated_at", players_data)
     with sqlite3.connect(CONTRACTS_DB_PATH) as conn:
-        conn.cursor().executemany("INSERT INTO contracts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(player_id) DO UPDATE SET club_name=excluded.club_name, last_updated_at=excluded.last_updated_at", contracts_data)
+        conn.cursor().executemany("INSERT INTO contracts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(player_id) DO UPDATE SET last_updated_at=excluded.last_updated_at", contracts_data)
 
 # ===================================================================
 # MAIN
@@ -155,23 +208,20 @@ def update_all_databases(players_list, agents_list):
 def main():
     start_time = time.time()
     setup_logging()
-    logging.info(f"{'='*60}\nSNAPCLUB v3.0 - DÉMARRAGE\n{'='*60}")
-    
     setup_databases()
     session = create_requests_session()
     
-    # 1. Leaderboard Agents
     agents = get_agents_leaderboard(session)
-    
-    # 2. Tous les joueurs en vrac (La partie la plus longue)
     players = get_all_players_bulk(session)
     
-    # 3. Traitement et BDD
     if players:
+        # 1. SQLite Local (pour Netlify/R2)
         update_all_databases(players, agents)
         
-        # 4. Upload vers R2
-        logging.info("Téléversement vers Cloudflare R2...")
+        # 2. MariaDB Oracle (pour l'historique)
+        sync_to_mariadb_history(players)
+        
+        # 3. Upload vers R2
         upload_file_to_r2(PLAYERS_DB_PATH, f"Players/{PLAYERS_DB_PATH}")
         upload_file_to_r2(CONTRACTS_DB_PATH, f"Clubs/Contrats.sqlite")
         upload_file_to_r2(AGENTS_DB_PATH, f"Agents/{AGENTS_DB_PATH}")
