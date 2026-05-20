@@ -82,8 +82,7 @@ def sync_to_mariadb_history(players_list):
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
         now_ts = int(time.time() * 1000)
-        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-
+        now_str = now_ts_int = int(time.time()) # Timestamp actuel en secondes
         logging.info(f"Début de la synchronisation de {len(players_list)} joueurs vers MariaDB...")
 
         for p in players_list:
