@@ -1,4 +1,4 @@
-# SnapClub.py (Version 4.1 - Clone Exact MariaDB + SQLite)
+# SnapClub.py (Version 4.2 - Correction Datetime pour MariaDB BIGINT)
 import os, json, time, logging, sys, sqlite3, requests
 import mysql.connector
 from requests.adapters import HTTPAdapter
@@ -17,7 +17,7 @@ AGENTS_DB_PATH = "Agents.sqlite"
 LIMIT_PER_PAGE = 1500
 SAFE_SLEEP = 0 
 
-# CONFIGURATION MARIADB (Secrets GitHub)
+# CONFIGURATION MARIADB
 DB_CONFIG = {
     'host': os.getenv("DB_HOST"),      
     'user': os.getenv("DB_USER", "ubuntu"),
@@ -25,15 +25,15 @@ DB_CONFIG = {
     'database': os.getenv("DB_NAME", "mfl_stats")
 }
 
-STATS_ORDER = ['passing', 'shooting', 'defense', 'dribbling', 'pace', 'physical']
+STATS_ORDER =['passing', 'shooting', 'defense', 'dribbling', 'pace', 'physical']
 _WEIGHTINGS_LIST = [
-    {'positions': ['CB'], 'weights': [0.05, 0, 0.64, 0.09, 0.02, 0.2]},
-    {'positions': ['LWB', 'RWB', 'LB', 'RB'], 'weights': [0.19, 0, 0.44, 0.17, 0.1, 0.1]},
-    {'positions': ['CDM'], 'weights': [0.28, 0, 0.4, 0.17, 0, 0.15]},
-    {'positions': ['CM', 'LM', 'RM'], 'weights': [0.43, 0.12, 0.1, 0.29, 0, 0.06]},
-    {'positions': ['CAM'], 'weights': [0.34, 0.21, 0, 0.38, 0.07, 0]},
-    {'positions': ['CF', 'LW', 'RW'], 'weights': [0.24, 0.23, 0, 0.4, 0.13, 0]},
-    {'positions': ['ST'], 'weights': [0.1, 0.46, 0, 0.29, 0.1, 0.05]}
+    {'positions': ['CB'], 'weights':[0.05, 0, 0.64, 0.09, 0.02, 0.2]},
+    {'positions': ['LWB', 'RWB', 'LB', 'RB'], 'weights':[0.19, 0, 0.44, 0.17, 0.1, 0.1]},
+    {'positions': ['CDM'], 'weights':[0.28, 0, 0.4, 0.17, 0, 0.15]},
+    {'positions': ['CM', 'LM', 'RM'], 'weights':[0.43, 0.12, 0.1, 0.29, 0, 0.06]},
+    {'positions': ['CAM'], 'weights':[0.34, 0.21, 0, 0.38, 0.07, 0]},
+    {'positions': ['CF', 'LW', 'RW'], 'weights':[0.24, 0.23, 0, 0.4, 0.13, 0]},
+    {'positions':['ST'], 'weights':[0.1, 0.46, 0, 0.29, 0.1, 0.05]}
 ]
 WEIGHTINGS = {}
 for item in _WEIGHTINGS_LIST:
@@ -69,28 +69,27 @@ def calculate_real_note(stats, position):
     return int(round(note))
 
 # ===================================================================
-# LOGIQUE MARIADB (HISTORIQUE ET SNAPSHOT ENTIER)
+# LOGIQUE MARIADB
 # ===================================================================
 
 def sync_to_mariadb_history(players_list):
-    """Compare les stats et met à jour MariaDB (1-to-1 avec SQLite)."""
     if not DB_CONFIG['host'] or not DB_CONFIG['password']:
-        logging.warning("⚠️ Configuration MariaDB absente dans les Secrets GitHub. Synchronisation ignorée.")
+        logging.warning("⚠️ Configuration MariaDB absente.")
         return
 
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
+        # now_ts est déjà un timestamp en ms, parfait pour la colonne BIGINT
         now_ts = int(time.time() * 1000)
-        now_str = now_ts_int = int(time.time()) # Timestamp actuel en secondes
-        logging.info(f"Début de la synchronisation de {len(players_list)} joueurs vers MariaDB...")
+
+        logging.info(f"Début de la synchronisation de {len(players_list)} joueurs...")
 
         for p in players_list:
             p_id = int(p['id'])
             meta = p.get('metadata', {})
             owned = p.get('ownedBy', {})
             
-            # Stats actuelles scannées
             new_stats = {
                 'overall': meta.get('overall', 0),
                 'age': meta.get('age', 0),
@@ -102,32 +101,21 @@ def sync_to_mariadb_history(players_list):
                 'physical': meta.get('physical', 0)
             }
 
-            # 1. On récupère l'ancienne photo du joueur en base
             cursor.execute("SELECT * FROM players_snapshot WHERE id = %s", (p_id,))
             old_data = cursor.fetchone()
 
             if old_data:
-                # 2. On compare pour créer l'historique (Delta)
-                diff = {}
-                for stat, val in new_stats.items():
-                    if val != old_data.get(stat):
-                        diff[stat] = val
-                
-                # 3. Si changement -> On écrit dans l'historique
+                diff = {stat: val for stat, val in new_stats.items() if val != old_data.get(stat)}
                 if diff:
-                    reason = "TRAINING"
-                    if 'age' in diff: reason = "NEW_AGE"
-                    
+                    reason = "NEW_AGE" if 'age' in diff else "TRAINING"
                     cursor.execute(
                         "INSERT INTO players_history (player_id, date, reasonType, values_changed) VALUES (%s, %s, %s, %s)",
                         (p_id, now_ts, reason, json.dumps(diff))
                     )
 
-            # Calcul des Real Notes (pour le Snapshot)
             stats_temp = {s: meta.get(s, 0) for s in STATS_ORDER + ['overall', 'goalkeeping']}
-            real_notes = {pos: (calculate_real_note(stats_temp, pos) - (1 if i > 0 else 0)) for i, pos in enumerate(meta.get('positions', []))}
+            real_notes = {pos: (calculate_real_note(stats_temp, pos) - (1 if i > 0 else 0)) for i, pos in enumerate(meta.get('positions',[]))}
 
-            # 4. On insère ou met à jour le Snapshot (1-to-1 avec SQLite) [1]
             sql_snap = """
                 INSERT INTO players_snapshot 
                 (id, first_name, last_name, age, nationalities, preferred_foot, overall, defense, shooting, passing, dribbling, pace, physical, goalkeeping, real_notes, retraite, manager, last_updated_at)
@@ -140,13 +128,14 @@ def sync_to_mariadb_history(players_list):
                 physical=VALUES(physical), goalkeeping=VALUES(goalkeeping), real_notes=VALUES(real_notes),
                 retraite=VALUES(retraite), manager=VALUES(manager), last_updated_at=VALUES(last_updated_at)
             """
+            # Utilisation de now_ts (entier) au lieu de now_str (chaine) pour correspondre au BIGINT
             cursor.execute(sql_snap, (
                 p_id, meta.get('firstName'), meta.get('lastName'), new_stats['age'],
-                json.dumps(meta.get('nationalities', [])), meta.get('preferredFoot'),
+                json.dumps(meta.get('nationalities',[])), meta.get('preferredFoot'),
                 new_stats['overall'], meta.get('defense', 0), new_stats['shooting'],
                 new_stats['passing'], new_stats['dribbling'], new_stats['pace'],
                 new_stats['physical'], meta.get('goalkeeping', 0), json.dumps(real_notes),
-                meta.get('retirementYears', 0), owned.get('name'), now_str
+                meta.get('retirementYears', 0), owned.get('name'), now_ts
             ))
 
         conn.commit()
@@ -156,6 +145,10 @@ def sync_to_mariadb_history(players_list):
     except Exception as e:
         logging.error(f"❌ Erreur MariaDB : {e}")
 
+# ===================================================================
+# COLLECTE & SQLite (Reste du code inchangé)
+# ... [Le reste du code est identique à votre version] ...
+# ===================================================================
 # ===================================================================
 # COLLECTE & SQLITE D'ORIGINE
 # ===================================================================
