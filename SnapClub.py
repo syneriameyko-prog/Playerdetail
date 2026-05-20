@@ -1,4 +1,4 @@
-# SnapClub.py (Version 4.0 - Hybrid MariaDB + SQLite)
+# SnapClub.py (Version 4.1 - Clone Exact MariaDB + SQLite)
 import os, json, time, logging, sys, sqlite3, requests
 import mysql.connector
 from requests.adapters import HTTPAdapter
@@ -17,15 +17,14 @@ AGENTS_DB_PATH = "Agents.sqlite"
 LIMIT_PER_PAGE = 1500
 SAFE_SLEEP = 0 
 
-# CONFIGURATION MARIADB (Utilise les Secrets GitHub)
+# CONFIGURATION MARIADB (Secrets GitHub)
 DB_CONFIG = {
-    'host': os.getenv("DB_HOST"),      # Mets l'IP publique de ta VM Oracle dans les secrets GitHub
+    'host': os.getenv("DB_HOST"),      
     'user': os.getenv("DB_USER", "ubuntu"),
-    'password': os.getenv("DB_PASSWORD"), # Ton mot de passe 'ton_pass' dans les secrets
+    'password': os.getenv("DB_PASSWORD"), 
     'database': os.getenv("DB_NAME", "mfl_stats")
 }
 
-# Configuration des poids pour le Real OVR
 STATS_ORDER = ['passing', 'shooting', 'defense', 'dribbling', 'pace', 'physical']
 _WEIGHTINGS_LIST = [
     {'positions': ['CB'], 'weights': [0.05, 0, 0.64, 0.09, 0.02, 0.2]},
@@ -50,7 +49,7 @@ def setup_logging():
 
 def create_requests_session():
     session = requests.Session()
-    session.headers.update({'User-Agent': 'SnapClub-Bulk-v4.0', 'Accept': 'application/json'})
+    session.headers.update({'User-Agent': 'SnapClub-Bulk-v4.1', 'Accept': 'application/json'})
     retries = Retry(total=5, backoff_factor=2, status_forcelist=[403, 429, 500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
     return session
@@ -70,26 +69,29 @@ def calculate_real_note(stats, position):
     return int(round(note))
 
 # ===================================================================
-# NOUVELLE LOGIQUE MARIADB (HISTORIQUE)
+# LOGIQUE MARIADB (HISTORIQUE ET SNAPSHOT ENTIER)
 # ===================================================================
 
 def sync_to_mariadb_history(players_list):
-    """Compare les stats et crée l'historique dans MariaDB (VM Oracle)."""
+    """Compare les stats et met à jour MariaDB (1-to-1 avec SQLite)."""
     if not DB_CONFIG['host'] or not DB_CONFIG['password']:
-        logging.warning("⚠️ Config MariaDB absente (Secrets GitHub non configurés). Skip sync.")
+        logging.warning("⚠️ Configuration MariaDB absente dans les Secrets GitHub. Synchronisation ignorée.")
         return
 
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
         now_ts = int(time.time() * 1000)
+        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-        logging.info(f"Synchronisation MariaDB pour {len(players_list)} joueurs...")
+        logging.info(f"Début de la synchronisation de {len(players_list)} joueurs vers MariaDB...")
 
         for p in players_list:
             p_id = int(p['id'])
             meta = p.get('metadata', {})
+            owned = p.get('ownedBy', {})
             
+            # Stats actuelles scannées
             new_stats = {
                 'overall': meta.get('overall', 0),
                 'age': meta.get('age', 0),
@@ -101,18 +103,18 @@ def sync_to_mariadb_history(players_list):
                 'physical': meta.get('physical', 0)
             }
 
-            # 1. On récupère l'ancienne photo du joueur
+            # 1. On récupère l'ancienne photo du joueur en base
             cursor.execute("SELECT * FROM players_snapshot WHERE id = %s", (p_id,))
             old_data = cursor.fetchone()
 
             if old_data:
-                # 2. On cherche les changements
+                # 2. On compare pour créer l'historique (Delta)
                 diff = {}
                 for stat, val in new_stats.items():
                     if val != old_data.get(stat):
                         diff[stat] = val
                 
-                # 3. Si changement -> Inscription dans l'histoire
+                # 3. Si changement -> On écrit dans l'historique
                 if diff:
                     reason = "TRAINING"
                     if 'age' in diff: reason = "NEW_AGE"
@@ -122,32 +124,41 @@ def sync_to_mariadb_history(players_list):
                         (p_id, now_ts, reason, json.dumps(diff))
                     )
 
-            # 4. Mise à jour du Snapshot
+            # Calcul des Real Notes (pour le Snapshot)
+            stats_temp = {s: meta.get(s, 0) for s in STATS_ORDER + ['overall', 'goalkeeping']}
+            real_notes = {pos: (calculate_real_note(stats_temp, pos) - (1 if i > 0 else 0)) for i, pos in enumerate(meta.get('positions', []))}
+
+            # 4. On insère ou met à jour le Snapshot (1-to-1 avec SQLite) [1]
             sql_snap = """
                 INSERT INTO players_snapshot 
-                (id, first_name, last_name, age, overall, pace, shooting, passing, dribbling, defense, physical, last_updated)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (id, first_name, last_name, age, nationalities, preferred_foot, overall, defense, shooting, passing, dribbling, pace, physical, goalkeeping, real_notes, retraite, manager, last_updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE 
-                overall=VALUES(overall), age=VALUES(age), last_updated=VALUES(last_updated),
-                pace=VALUES(pace), shooting=VALUES(shooting), passing=VALUES(passing),
-                dribbling=VALUES(dribbling), defense=VALUES(defense), physical=VALUES(physical)
+                first_name=VALUES(first_name), last_name=VALUES(last_name), age=VALUES(age),
+                nationalities=VALUES(nationalities), preferred_foot=VALUES(preferred_foot),
+                overall=VALUES(overall), defense=VALUES(defense), shooting=VALUES(shooting),
+                passing=VALUES(passing), dribbling=VALUES(dribbling), pace=VALUES(pace),
+                physical=VALUES(physical), goalkeeping=VALUES(goalkeeping), real_notes=VALUES(real_notes),
+                retraite=VALUES(retraite), manager=VALUES(manager), last_updated_at=VALUES(last_updated_at)
             """
             cursor.execute(sql_snap, (
                 p_id, meta.get('firstName'), meta.get('lastName'), new_stats['age'],
-                new_stats['overall'], new_stats['pace'], new_stats['shooting'],
-                new_stats['passing'], new_stats['dribbling'], new_stats['defense'],
-                new_stats['physical'], now_ts
+                json.dumps(meta.get('nationalities', [])), meta.get('preferredFoot'),
+                new_stats['overall'], meta.get('defense', 0), new_stats['shooting'],
+                new_stats['passing'], new_stats['dribbling'], new_stats['pace'],
+                new_stats['physical'], meta.get('goalkeeping', 0), json.dumps(real_notes),
+                meta.get('retirementYears', 0), owned.get('name'), now_str
             ))
 
         conn.commit()
         cursor.close()
         conn.close()
-        logging.info("✅ MariaDB synchronisée.")
+        logging.info("✅ MariaDB synchronisée avec succès.")
     except Exception as e:
         logging.error(f"❌ Erreur MariaDB : {e}")
 
 # ===================================================================
-# COLLECTE & SQLITE (TON CODE D'ORIGINE)
+# COLLECTE & SQLITE D'ORIGINE
 # ===================================================================
 
 def get_agents_leaderboard(session):
