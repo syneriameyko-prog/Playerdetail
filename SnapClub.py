@@ -16,6 +16,7 @@ AGENTS_DB_PATH = "Agents.sqlite"
 
 # Paramètres de l'API
 LIMIT_PER_PAGE = 1500
+MAX_WORKERS = 2
 SAFE_SLEEP = 0  # Petite pause entre chaque page de 1500 joueurs
 
 # Configuration des poids pour le Real OVR
