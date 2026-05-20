@@ -5,7 +5,7 @@ on:
   schedule:
     - cron: '30 9 * * *'
     - cron: '2 22 * * *'
-
+ 
 jobs:
   update-snapclub-database:
     name: 'Exécuter SnapClub et Uploader sur R2 + MariaDB'
